@@ -86,7 +86,14 @@
             "ext-gd": "1",
             "ext-zip": "1",
             "ext-bcmath": "1",
-            "ext-sodium": "1"
+            "ext-sodium": "1",
+            "ext-curl": "1",
+            "ext-mbstring": "1",
+            "ext-xml": "1",
+            "ext-tokenizer": "1",
+            "ext-pdo": "1",
+            "ext-pdo_mysql": "1",
+            "php": "8.2"
         }
     },
     "minimum-stability": "stable",
