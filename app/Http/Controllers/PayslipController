@@ -1,0 +1,70 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\PayrollRecord;
+use App\Models\PayrollPeriod;
+use Illuminate\Http\Request;
+use Barryvdh\DomPDF\Facade\Pdf;
+
+class PayslipController extends Controller
+{
+    /**
+     * Print ALL payslips for a given payroll period (4 per page).
+     * Route: GET /payroll/{period}/payslip-all-pdf
+     *
+     * Usage in your blade/button:
+     *   <a href="{{ route('payroll.payslip-all-pdf', $period->id) }}" target="_blank">
+     *       Print All Payslips
+     *   </a>
+     */
+    public function printAll(PayrollPeriod $period)
+    {
+        $records = PayrollRecord::with([
+                'employee.position',
+                'period.createdBy',
+            ])
+            ->where('period_id', $period->id)
+            ->orderBy('employee_id')
+            ->get();
+
+        if ($records->isEmpty()) {
+            abort(404, 'No payroll records found for this period.');
+        }
+
+        $pdf = Pdf::loadView('payroll.payslip-pdf', compact('records'))
+            ->setPaper('letter', 'portrait');
+
+        return $pdf->stream("payslips-{$period->period_label}.pdf");
+    }
+
+    /**
+     * Print a SINGLE employee's payslip.
+     * Route: GET /payroll/{period}/payslip-pdf?emp_id=XXXXX
+     *
+     * Usage in your blade/button:
+     *   <a href="{{ route('payroll.payslip-pdf', ['period' => $period->id, 'emp_id' => $record->employee_id]) }}" target="_blank">
+     *       Print My Payslip
+     *   </a>
+     */
+    public function printOne(Request $request, PayrollPeriod $period)
+    {
+        $empId = $request->query('emp_id');
+
+        $record = PayrollRecord::with([
+                'employee.position',
+                'period.createdBy',
+            ])
+            ->where('period_id', $period->id)
+            ->where('employee_id', $empId)
+            ->firstOrFail();
+
+        // Wrap in a collection so the blade foreach works for both cases
+        $records = collect([$record]);
+
+        $pdf = Pdf::loadView('payroll.payslip-pdf', compact('records'))
+            ->setPaper('letter', 'portrait');
+
+        return $pdf->stream("payslip-{$record->employee->last_name}-{$period->period_label}.pdf");
+    }
+}
