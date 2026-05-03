@@ -139,7 +139,7 @@
 <div id="toast"><div class="ti" id="tI"></div><div><p style="font-size:13px;font-weight:700;color:#111827;margin:0;" id="tT"></p><p style="font-size:12px;color:#9ca3af;margin:3px 0 0;" id="tM"></p></div></div>
 
 <script>
-const CSRF='{{csrf_token()}}', BASE='{{route("settings.commutation")}}';
+const CSRF='{{csrf_token()}}', BASE='{{route("settings.recommendation")}}';
 let eid=null, did=null;
 function filterRows(){const q=document.getElementById('si').value.toLowerCase();document.querySelectorAll('.row').forEach(r=>r.style.display=r.dataset.label.includes(q)?'':'none');}
 function openAdd(){eid=null;document.getElementById('mT').textContent='Add Recommendation Option';document.getElementById('bS').textContent='Add Option';document.getElementById('fN').value='';document.getElementById('fo').classList.add('show');setTimeout(()=>document.getElementById('fN').focus(),150);}

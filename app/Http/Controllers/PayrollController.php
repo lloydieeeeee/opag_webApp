@@ -2,453 +2,558 @@
 
 namespace App\Http\Controllers;
 
-use Illuminate\Http\Request;
 use App\Models\Employee;
 use App\Models\PayrollPeriod;
 use App\Models\PayrollRecord;
 use App\Models\PayrollDeduction;
-use Illuminate\Support\Facades\Auth;
+use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
-use Barryvdh\DomPDF\Facade\Pdf;
+use Illuminate\Support\Facades\Auth;
+use Carbon\Carbon;
 
 class PayrollController extends Controller
 {
-    /* ══════════════════════════════════════════════════════
-       INDEX
-    ══════════════════════════════════════════════════════ */
+    const CNG_FIELDS = [
+        'cng_capital_share', 'cng_kiddie_savings', 'cng_savings', 'cng_regular_loan',
+        'cng_crisis_loan', 'cng_coop_canteen', 'cng_coop_store', 'cng_calamity_loan',
+        'cng_abuloy', 'cng_handog', 'cng_b2b_loan', 'cng_petty_cash', 'cng_commodity_loan'
+    ];
+
+    private function isAdmin(): bool
+    {
+        $user = Auth::user();
+        if (!$user) return false;
+
+        if (isset($user->access) && strtolower($user->access->user_access ?? '') === 'admin') return true;
+        if (isset($user->userAccess) && strtolower($user->userAccess->user_access ?? '') === 'admin') return true;
+        if (method_exists($user, 'hasRole') && $user->hasRole('admin')) return true;
+        if (isset($user->user_access) && strtolower($user->user_access) === 'admin') return true;
+        if (isset($user->role) && strtolower($user->role) === 'admin') return true;
+
+        $empId = $user->employee_id ?? optional($user->employee)->employee_id ?? null;
+        if ($empId) {
+            $row = DB::table('user_access')->where('employee_id', $empId)->where('is_active', 1)->value('user_access');
+            if ($row && strtolower($row) === 'admin') return true;
+        }
+
+        return false;
+    }
+
+    private function isGovtShareColumn(?string $col): bool
+    {
+        return in_array($col, ['gsis_govt', 'philhealth_govt', 'pagibig_govt'], true);
+    }
+
+    private function normaliseOverrides(array $overrides): array
+    {
+        $out = [];
+        foreach ($overrides as $key => $value) {
+            if ($key === 'allowance_ra') {
+                $out['allowance_rata'] = $value;
+            } else {
+                $out[$key] = $value;
+            }
+        }
+        return $out;
+    }
+
+    // ── FALLBACK MAPPER FOR OLD JSON RECORDS ──
+    private function mapOldCngData($records)
+    {
+        if (empty($records)) return $records;
+
+        $isSingle = false;
+        if ($records instanceof \App\Models\PayrollRecord) {
+            $records = [$records];
+            $isSingle = true;
+        }
+
+        foreach ($records as $r) {
+            if (!$r) continue;
+            $dyn = is_string($r->dynamic_deductions) ? json_decode($r->dynamic_deductions, true) : ($r->dynamic_deductions ?? []);
+            if (!empty($dyn)) {
+                $r->cng_capital_share  = $r->cng_capital_share ?: (float)($dyn[32] ?? 0);
+                $r->cng_kiddie_savings = $r->cng_kiddie_savings ?: (float)($dyn[33] ?? 0);
+                $r->cng_savings        = $r->cng_savings ?: (float)($dyn[34] ?? 0);
+                $r->cng_regular_loan   = $r->cng_regular_loan ?: (float)($dyn[35] ?? 0);
+                $r->cng_crisis_loan    = $r->cng_crisis_loan ?: (float)($dyn[36] ?? 0);
+                $r->cng_coop_canteen   = $r->cng_coop_canteen ?: (float)($dyn[37] ?? 0);
+                $r->cng_coop_store     = $r->cng_coop_store ?: (float)($dyn[38] ?? 0);
+                $r->cng_calamity_loan  = $r->cng_calamity_loan ?: (float)($dyn[39] ?? 0);
+                $r->cng_abuloy         = $r->cng_abuloy ?: (float)($dyn[40] ?? 0);
+                $r->cng_handog         = $r->cng_handog ?: (float)($dyn[41] ?? 0);
+                $r->cng_b2b_loan       = $r->cng_b2b_loan ?: (float)($dyn[42] ?? 0);
+                $r->cng_petty_cash     = $r->cng_petty_cash ?: (float)($dyn[43] ?? 0);
+                $r->cng_commodity_loan = $r->cng_commodity_loan ?: (float)($dyn[44] ?? 0);
+                
+                $cngSum = $r->cng_capital_share + $r->cng_kiddie_savings + $r->cng_savings + 
+                          $r->cng_regular_loan + $r->cng_crisis_loan + $r->cng_coop_canteen + 
+                          $r->cng_coop_store + $r->cng_calamity_loan + $r->cng_abuloy + 
+                          $r->cng_handog + $r->cng_b2b_loan + $r->cng_petty_cash + $r->cng_commodity_loan;
+                
+                if ($cngSum > 0 && !$r->loan_cngwmpc) {
+                    $r->loan_cngwmpc = $cngSum;
+                }
+            }
+        }
+        return $isSingle ? $records[0] : $records;
+    }
+
+    public function computeFromSalary(float $gross, array $overrides = [], Employee $employee = null): array
+    {
+        $overrides = $this->normaliseOverrides($overrides);
+        $deductions = PayrollDeduction::active()->ordered()->get();
+        $hardFields    = [];
+        $dynamicFields = [];
+        $totalDeductions = 0.0;
+        $totalAllowances = 0.0;
+
+        // Check if the employee is the Provincial Agriculturist (PA)
+        $isPA = false;
+        if ($employee && $employee->position) {
+            $isPA = (strtoupper(trim($employee->position->position_code)) === 'PA');
+        }
+
+        foreach ($deductions as $ded) {
+            if ($ded->parent_id == 9 || $ded->name === 'CNGWPC') continue;
+
+            $col   = $ded->resolveColumn();
+            $isDyn = ($col === null);
+            $isAll = $ded->isAllowance();
+
+            if ($ded->isFixed()) {
+                if (!$isDyn && array_key_exists($col, $overrides)) {
+                    $amount = (float) $overrides[$col];
+                } elseif ($isDyn && array_key_exists($ded->id, $overrides)) {
+                    $amount = (float) $overrides[$ded->id];
+                } else {
+                    // ★ APPLY RA/TA LOGIC HERE ★
+                    if ($col === 'allowance_rata' || $col === 'allowance_ta') {
+                        // Only compute the 9500 default if the position is 'PA'
+                        $amount = $isPA ? $ded->compute($gross) : 0.0;
+                    } else {
+                        $amount = $ded->compute($gross);
+                    }
+                }
+            } else {
+                if (!$isDyn && $col !== null && array_key_exists($col, $overrides)) $amount = (float) $overrides[$col];
+                elseif ($isDyn && array_key_exists($ded->id, $overrides)) $amount = (float) $overrides[$ded->id];
+                else $amount = 0.0;
+            }
+
+            $amount = round($amount, 2);
+
+            if ($isDyn) $dynamicFields[$ded->id] = $amount;
+            else $hardFields[$col] = ($hardFields[$col] ?? 0) + $amount;
+
+            if ($isAll) $totalAllowances += $amount;
+            elseif (!$this->isGovtShareColumn($col)) $totalDeductions += $amount;
+        }
+
+        $cngTotal = 0;
+        foreach (self::CNG_FIELDS as $f) {
+            $val = isset($overrides[$f]) ? round((float) $overrides[$f], 2) : 0.0;
+            $hardFields[$f] = $val;
+            $totalDeductions += $val;
+            $cngTotal += $val;
+        }
+        $hardFields['loan_cngwmpc'] = $cngTotal;
+
+        $hardDefaults = [
+            'gsis_ee' => 0, 'gsis_govt' => 0, 'gsis_ec' => 0, 'gsis_policy' => 0, 'gsis_emergency' => 0, 'gsis_real_estate' => 0,
+            'gsis_mpl' => 0, 'gsis_mpl_lite' => 0, 'gsis_gfal' => 0, 'gsis_computer' => 0, 'gsis_conso' => 0,
+            'pagibig_ee' => 0, 'pagibig_govt' => 0, 'pagibig_mpl' => 0, 'pagibig_calamity' => 0,
+            'philhealth_ee' => 0, 'philhealth_govt' => 0, 'withholding_tax' => 0,
+            'loan_dbp' => 0, 'loan_lbp' => 0, 'loan_paracle' => 0, 'overpayment' => 0, 'other_deduction' => 0,
+            'allowance_pera' => 0, 'allowance_rata' => 0, 'allowance_ta' => 0, 'allowance_other' => 0,
+        ];
+
+        $hardFields = array_merge($hardDefaults, $hardFields);
+        $totalDeductions = round($totalDeductions, 2);
+        $totalAllowances = round($totalAllowances, 2);
+        $netPay          = round($gross - $totalDeductions + $totalAllowances, 2);
+
+        return array_merge($hardFields, [
+            'gross_salary'       => $gross,
+            'dynamic_deductions' => empty($dynamicFields) ? null : $dynamicFields,
+            'total_deductions'   => $totalDeductions,
+            'total_allowances'   => $totalAllowances,
+            'net_pay'            => $netPay,
+        ]);
+    }
+
+    private function generatePayrollForPeriod(PayrollPeriod $period, array $employeeIds = [], array $overrides   = []): int {
+        $query = Employee::where('is_active', 1)->where('salary', '>', 0);
+        if (!empty($employeeIds)) $query->whereIn('employee_id', $employeeIds);
+
+        $count = 0;
+        
+        PayrollRecord::unguard();
+
+        $query->each(function (Employee $emp) use ($period, $overrides, &$count) {
+            $empOverrides = $overrides[$emp->employee_id] ?? [];
+            // Pass the employee object to the computation logic
+            $data         = $this->computeFromSalary((float) $emp->salary, $empOverrides, $emp);
+            $data['designation'] = optional($emp->position)->position_code;
+
+            PayrollRecord::updateOrCreate(
+                ['period_id' => $period->period_id, 'employee_id' => $emp->employee_id],
+                $data
+            );
+            $count++;
+        });
+
+        PayrollRecord::reguard();
+
+        return $count;
+    }
+
     public function index(Request $request)
     {
         $periods = PayrollPeriod::orderByDesc('year')->orderByDesc('month')->get();
-        $selectedPeriodId = $request->query('period_id', optional($periods->first())->period_id);
-        $selectedPeriod   = $periods->find($selectedPeriodId);
+        $selectedPeriodId = $request->input('period_id', optional($periods->first())->period_id);
+        $selectedPeriod = $periods->find($selectedPeriodId);
 
-        $records = collect();
-        $summary = (object)[
-            'gross'      => 0, 'deductions' => 0,
-            'net'        => 0, 'employees'  => 0,
-            'pera_total' => 0, 'gsis_ee'    => 0,
-            'philhealth' => 0, 'pagibig'    => 0,
-            'wtax'       => 0,
-        ];
-
-        if ($selectedPeriod) {
-            $records = PayrollRecord::with(['employee.position', 'employee.department'])
-                ->where('period_id', $selectedPeriod->period_id)
-                ->get();
-
-            $summary = (object)[
-                'gross'      => $records->sum('gross_salary'),
-                'deductions' => $records->sum('total_deductions'),
-                'net'        => $records->sum('net_pay'),
-                'employees'  => $records->count(),
-                'pera_total' => $records->sum('allowance_pera'),
-                'gsis_ee'    => $records->sum('gsis_ee'),
-                'philhealth' => $records->sum('philhealth_ee'),
-                'pagibig'    => $records->sum('pagibig_ee'),
-                'wtax'       => $records->sum('withholding_tax'),
-            ];
+        if ($selectedPeriod && $selectedPeriod->status === 'FINALIZED') {
+            if (PayrollRecord::where('period_id', $selectedPeriod->period_id)->count() === 0) {
+                $this->generatePayrollForPeriod($selectedPeriod);
+            }
         }
 
-        return view('payroll.index', compact(
-            'periods', 'selectedPeriod', 'records', 'summary'
-        ));
-    }
-
-    /* ══════════════════════════════════════════════════════
-       CREATE PERIOD FORM
-    ══════════════════════════════════════════════════════ */
-    public function createPeriod()
-    {
-        // DB table is `employee` (singular) — Employee model must have $table = 'employee'
-        $employees = Employee::with(['position', 'department'])
-            ->where('is_active', 1)
-            ->orderBy('last_name')
+        $records = PayrollRecord::with(['employee.position', 'employee.department'])
+            ->where('period_id', optional($selectedPeriod)->period_id)
+            ->orderBy('employee_id')
             ->get();
+            
+        $records = $this->mapOldCngData($records); // <--- Auto-map old data
 
-        return view('payroll.create', compact('employees'));
+        $summary = (object) [
+            'employees'  => $records->count(),
+            'gross'      => $records->sum('gross_salary'),
+            'deductions' => $records->sum('total_deductions'),
+            'net'        => $records->sum('net_pay'),
+            'wtax'       => $records->sum('withholding_tax'),
+            'gsis_ee'    => $records->sum('gsis_ee'),
+            'gsis_govt'  => $records->sum('gsis_govt'),
+            'gsis_ec'    => $records->sum('gsis_ec'),
+            'pagibig'    => $records->sum('pagibig_govt'),
+            'philhealth' => $records->sum('philhealth_ee'),
+            'pera_total' => $records->sum('allowance_pera'),
+        ];
+
+        $jsConfig = PayrollDeduction::buildJsConfig();
+        return view('payroll.index', compact('periods', 'selectedPeriod', 'records', 'summary', 'jsConfig'));
     }
 
-    /* ══════════════════════════════════════════════════════
-       STORE PERIOD + RECORDS
-    ══════════════════════════════════════════════════════ */
-    public function storePeriod(Request $request)
+    public function create()
+    {
+        $jsConfig = PayrollDeduction::buildJsConfig();
+        return view('payroll.create', compact('jsConfig'));
+    }
+
+    public function store(Request $request)
     {
         $request->validate([
             'month'          => 'required|integer|between:1,12',
-            'year'           => 'required|integer|min:2020|max:2099',
+            'year'           => 'required|integer|min:2000|max:2100',
             'period_label'   => 'required|string|max:100',
             'employee_ids'   => 'required|array|min:1',
-            // FIX #1: table is `employee` (singular), not `employees`
-            'employee_ids.*' => 'exists:employee,employee_id',
+            'employee_ids.*' => 'integer',
         ]);
 
-        // ── SERVER-SIDE DUPLICATE CHECK ────────────────────────────────────
-        $existing = PayrollPeriod::where('month', $request->month)
-            ->where('year', $request->year)
-            ->first();
-
+        $existing = PayrollPeriod::where('month', $request->month)->where('year', $request->year)->first();
         if ($existing) {
-            return back()->withErrors([
-                'month' => "A payroll period for {$existing->period_label} already exists ({$existing->status}). Please select a different month/year.",
-            ]);
+            return redirect()->route('payroll.index', ['period_id' => $existing->period_id])
+                             ->with('error', "A payroll period for {$existing->period_label} already exists.");
         }
-        // ──────────────────────────────────────────────────────────────────
 
-        DB::transaction(function () use ($request) {
+        $period = PayrollPeriod::create([
+            'period_label' => $request->period_label, 'month' => $request->month,
+            'year' => $request->year, 'status' => 'DRAFT',
+            'created_by' => Auth::user()?->employee?->employee_id,
+        ]);
 
-            $period = PayrollPeriod::create([
-                'period_label' => $request->period_label,
-                'month'        => $request->month,
-                'year'         => $request->year,
-                'status'       => 'DRAFT',
-                'created_by'   => Auth::id(),
-            ]);
+        $rawOverrides = $request->input('overrides', []);
+        $overrides = [];
+        foreach ($rawOverrides as $empId => $fields) {
+            $overrides[$empId] = $this->normaliseOverrides((array) $fields);
+        }
 
-            // Load active deductions from `payroll_deductions` table, keyed by name
-            $dbDeductions = PayrollDeduction::where('is_active', 1)->get()->keyBy('name');
+        $this->generatePayrollForPeriod($period, $request->employee_ids, $overrides);
 
-            // Helper: resolve amount from a deduction config row
-            $computeAmount = function ($record, float $gross): float {
-                if (!$record) return 0.0;
-                if ($record->rate_type === 'percent') {
-                    $amount = round($gross * (float) $record->rate_value, 2);
-                    if ($record->limit_amount !== null) {
-                        $amount = min($amount, (float) $record->limit_amount);
-                    }
-                    return $amount;
-                }
-                return round((float) $record->rate_value, 2);
-            };
-
-            $overrides = $request->input('overrides', []);
-
-            foreach ($request->employee_ids as $empId) {
-                $employee = Employee::find($empId);
-                if (!$employee) continue;
-
-                $gross = (float) ($employee->salary ?? 0);
-
-                // ── Fixed deductions (from payroll_deductions table) ────────
-                // Exact name matches from DB data:
-                $gsisEe   = $computeAmount($dbDeductions->get('GSIS Employee Share'), $gross);   // 9%
-                $gsisGovt = $computeAmount($dbDeductions->get("GSIS Gov't Share"), $gross);      // 40%
-                $gsisEc   = $computeAmount($dbDeductions->get('ECF (Employee Compensation Fund)'), $gross); // flat 100
-
-                // FIX #2: "PAGIBIG Employee Share" does NOT exist in DB.
-                // DB only has "PAGIBIG Gov't Share" (flat 200). Use it for both sides.
-                $pagibigEe = $computeAmount($dbDeductions->get("PAGIBIG Gov't Share"), $gross); // flat 200
-                $pagibigGv = $computeAmount($dbDeductions->get("PAGIBIG Gov't Share"), $gross); // flat 200
-
-                $phicEe   = $computeAmount($dbDeductions->get('PhilHealth Employee Share'), $gross); // 2.5% cap 2500
-                $phicGovt = $computeAmount($dbDeductions->get("PhilHealth Gov't Share"), $gross);    // 12% cap 2500
-
-                $pera = $computeAmount($dbDeductions->get('PERA'), $gross); // flat 2000
-
-                // ── Per-employee overrides (loan / variable allowance fields) ──
-                $ov = $overrides[$empId] ?? [];
-
-                $gsisPolicy     = (float) ($ov['gsis_policy']      ?? 0);
-                $gsisEmergency  = (float) ($ov['gsis_emergency']   ?? 0);
-                $gsisRealEstate = (float) ($ov['gsis_real_estate'] ?? 0);
-                $gsisMpl        = (float) ($ov['gsis_mpl']         ?? 0);
-                $gsisMplLite    = (float) ($ov['gsis_mpl_lite']    ?? 0);
-                $gsisGfal       = (float) ($ov['gsis_gfal']        ?? 0);
-                $gsisComputer   = (float) ($ov['gsis_computer']    ?? 0);
-                $gsisConso      = (float) ($ov['gsis_conso']       ?? 0);
-                $pagibigMpl     = (float) ($ov['pagibig_mpl']      ?? 0);
-                $pagibigCal     = (float) ($ov['pagibig_calamity'] ?? 0);
-                $wtax           = (float) ($ov['withholding_tax']  ?? 0);
-                $loanDbp        = (float) ($ov['loan_dbp']         ?? 0);
-                $loanLbp        = (float) ($ov['loan_lbp']         ?? 0);
-                $loanCngwmpc    = (float) ($ov['loan_cngwmpc']     ?? 0);
-                $loanParacle    = (float) ($ov['loan_paracle']      ?? 0);
-                $overpayment    = (float) ($ov['overpayment']       ?? 0);
-                $allowRata      = (float) ($ov['allowance_rata']   ?? 0);
-                $allowTa        = (float) ($ov['allowance_ta']     ?? 0);
-
-                // ── Compute totals ──────────────────────────────────────────
-                $totalDeductions =
-                    $gsisEe + $gsisEc
-                    + $gsisPolicy + $gsisEmergency + $gsisRealEstate
-                    + $gsisMpl + $gsisMplLite + $gsisGfal + $gsisComputer + $gsisConso
-                    + $pagibigEe + $pagibigMpl + $pagibigCal
-                    + $phicEe
-                    + $wtax + $loanDbp + $loanLbp + $loanCngwmpc + $loanParacle
-                    + $overpayment;
-
-                $totalAllowances = $pera + $allowRata + $allowTa;
-                $netPay          = $gross - $totalDeductions + $totalAllowances;
-
-                // FIX #3: `allowance_ta` is the actual DB column (not `allowance_other`)
-                PayrollRecord::updateOrCreate(
-                    [
-                        'period_id'   => $period->period_id,
-                        'employee_id' => $empId,
-                    ],
-                    [
-                        'employee_code'    => null,
-                        'designation'      => optional($employee->position)->position_code,
-                        'gross_salary'     => $gross,
-
-                        // GSIS
-                        'gsis_ee'          => $gsisEe,
-                        'gsis_govt'        => $gsisGovt,
-                        'gsis_ec'          => $gsisEc,
-                        'gsis_policy'      => $gsisPolicy,
-                        'gsis_emergency'   => $gsisEmergency,
-                        'gsis_real_estate' => $gsisRealEstate,
-                        'gsis_mpl'         => $gsisMpl,
-                        'gsis_mpl_lite'    => $gsisMplLite,
-                        'gsis_gfal'        => $gsisGfal,
-                        'gsis_computer'    => $gsisComputer,
-                        'gsis_conso'       => $gsisConso,
-
-                        // PAG-IBIG
-                        'pagibig_ee'       => $pagibigEe,
-                        'pagibig_govt'     => $pagibigGv,
-                        'pagibig_mpl'      => $pagibigMpl,
-                        'pagibig_calamity' => $pagibigCal,
-
-                        // PhilHealth
-                        'philhealth_ee'    => $phicEe,
-                        'philhealth_govt'  => $phicGovt,
-
-                        // Tax & Loans
-                        'withholding_tax'  => $wtax,
-                        'loan_dbp'         => $loanDbp,
-                        'loan_lbp'         => $loanLbp,
-                        'loan_cngwmpc'     => $loanCngwmpc,
-                        'loan_paracle'     => $loanParacle,
-                        'overpayment'      => $overpayment,
-
-                        // Allowances — exact column names from `payroll_record` schema
-                        'allowance_pera'   => $pera,
-                        'allowance_rata'   => $allowRata,
-                        'allowance_ta'     => $allowTa,  // FIX #3: was 'allowance_other'
-                        'allowance_other'  => 0,         // spare column
-
-                        // Totals
-                        'total_deductions' => $totalDeductions,
-                        'total_allowances' => $totalAllowances,
-                        'net_pay'          => $netPay,
-                    ]
-                );
-            }
-        });
-
-        $count = count($request->employee_ids);
-
-        return redirect()
-            ->route('payroll.index')
-            ->with('success', "Payroll for {$request->period_label} created successfully with {$count} employee(s).");
+        return redirect()->route('payroll.index', ['period_id' => $period->period_id])
+                         ->with('success', "Payroll for {$period->period_label} generated successfully.");
     }
 
-    /* ══════════════════════════════════════════════════════
-       EDIT A SINGLE RECORD (inline AJAX)
-       FIX: PayrollRecord model must have $primaryKey = 'payroll_id'
-    ══════════════════════════════════════════════════════ */
-    public function updateRecord(Request $request, $payrollId)
+    public function finalize($period)
     {
-        $record = PayrollRecord::findOrFail($payrollId);
+        if (!$period instanceof PayrollPeriod) $period = PayrollPeriod::findOrFail($period);
+        if ($period->status === 'FINALIZED') return back()->with('error', 'Period is already finalized.');
 
-        if ($record->period->status === 'FINALIZED') {
-            return response()->json(['error' => 'Cannot edit a finalized payroll.'], 422);
+        if (PayrollRecord::where('period_id', $period->period_id)->count() === 0) {
+            $this->generatePayrollForPeriod($period);
         }
 
-        $data = $request->only([
-            'gross_salary', 'designation', 'remarks',
-            'gsis_ee', 'gsis_govt', 'gsis_ec',
-            'gsis_real_estate', 'gsis_conso', 'gsis_emergency',
-            'gsis_mpl', 'gsis_mpl_lite', 'gsis_gfal', 'gsis_computer', 'gsis_policy',
-            'pagibig_ee', 'pagibig_govt', 'pagibig_mpl', 'pagibig_calamity',
-            'philhealth_ee', 'philhealth_govt',
-            'withholding_tax', 'loan_dbp', 'loan_lbp', 'loan_cngwmpc', 'loan_paracle',
-            'overpayment',
-            'allowance_pera', 'allowance_rata', 'allowance_ta', 'allowance_other',
-        ]);
+        $period->update(['status' => 'FINALIZED']);
+        return redirect()->route('payroll.index', ['period_id' => $period->period_id])
+                         ->with('success', "Payroll for {$period->period_label} has been finalized.");
+    }
 
-        $deductions = collect([
-            $data['gsis_ee']          ?? $record->gsis_ee,
-            $data['gsis_ec']          ?? $record->gsis_ec,
-            $data['gsis_real_estate'] ?? $record->gsis_real_estate,
-            $data['gsis_conso']       ?? $record->gsis_conso,
-            $data['gsis_emergency']   ?? $record->gsis_emergency,
-            $data['gsis_mpl']         ?? $record->gsis_mpl,
-            $data['gsis_mpl_lite']    ?? $record->gsis_mpl_lite,
-            $data['gsis_gfal']        ?? $record->gsis_gfal,
-            $data['gsis_computer']    ?? $record->gsis_computer,
-            $data['gsis_policy']      ?? $record->gsis_policy,
-            $data['pagibig_ee']       ?? $record->pagibig_ee,
-            $data['pagibig_mpl']      ?? $record->pagibig_mpl,
-            $data['pagibig_calamity'] ?? $record->pagibig_calamity,
-            $data['philhealth_ee']    ?? $record->philhealth_ee,
-            $data['withholding_tax']  ?? $record->withholding_tax,
-            $data['loan_dbp']         ?? $record->loan_dbp,
-            $data['loan_lbp']         ?? $record->loan_lbp,
-            $data['loan_cngwmpc']     ?? $record->loan_cngwmpc,
-            $data['loan_paracle']     ?? $record->loan_paracle,
-            $data['overpayment']      ?? $record->overpayment,
-        ])->sum();
+    public function updateRecord(Request $request, $id)
+    {
+        $record = PayrollRecord::findOrFail($id);
+        $period = PayrollPeriod::find($record->period_id);
 
-        $allowances = collect([
-            $data['allowance_pera']  ?? $record->allowance_pera,
-            $data['allowance_rata']  ?? $record->allowance_rata,
-            $data['allowance_ta']    ?? $record->allowance_ta,    // FIX: was allowance_other
-            $data['allowance_other'] ?? $record->allowance_other,
-        ])->sum();
+        if (optional($period)->status === 'FINALIZED') {
+            return response()->json(['success' => false, 'error' => 'Period is finalized.'], 403);
+        }
 
-        $gross  = (float) ($data['gross_salary'] ?? $record->gross_salary);
-        $netPay = $gross - $deductions + $allowances;
+        $hardNumeric = [
+            'gross_salary', 'gsis_ee', 'gsis_ec', 'gsis_policy', 'gsis_emergency', 'gsis_real_estate',
+            'gsis_mpl', 'gsis_mpl_lite', 'gsis_gfal', 'gsis_computer', 'gsis_conso',
+            'pagibig_ee', 'pagibig_govt', 'pagibig_mpl', 'pagibig_calamity', 'philhealth_ee', 'withholding_tax',
+            'loan_dbp', 'loan_lbp', 'loan_cngwmpc', 'loan_paracle',
+            'cng_capital_share', 'cng_kiddie_savings', 'cng_savings', 'cng_regular_loan',
+            'cng_crisis_loan', 'cng_coop_canteen', 'cng_coop_store', 'cng_calamity_loan',
+            'cng_abuloy', 'cng_handog', 'cng_b2b_loan', 'cng_petty_cash', 'cng_commodity_loan',
+            'overpayment', 'other_deduction', 'allowance_pera', 'allowance_rata', 'allowance_ta', 'allowance_other',
+        ];
 
-        $data['total_deductions'] = $deductions;
-        $data['total_allowances'] = $allowances;
-        $data['net_pay']          = $netPay;
+        foreach ($hardNumeric as $col) {
+            if ($request->has($col)) $record->$col = round((float) $request->input($col), 2);
+        }
+        if ($request->has('allowance_ra')) $record->allowance_rata = round((float) $request->input('allowance_ra'), 2);
+        if ($request->has('other_deduction_label')) $record->other_deduction_label = substr(trim($request->input('other_deduction_label', '')), 0, 100);
 
-        $record->update($data);
+        $cngSum = 0;
+        foreach(self::CNG_FIELDS as $f) { $cngSum += (float) $record->$f; }
+        $record->loan_cngwmpc = $cngSum;
+
+        $dynamicInput = $request->input('dynamic', []);
+        if (!empty($dynamicInput)) {
+            $dynamic = $record->dynamic_deductions ?? [];
+            foreach ($dynamicInput as $dedId => $amount) { $dynamic[(int) $dedId] = round((float) $amount, 2); }
+            $record->dynamic_deductions = $dynamic;
+        }
+
+        if (method_exists($record, 'recomputeTotals')) {
+            $deductionConfig = PayrollDeduction::active()->ordered()->get()->keyBy('id');
+            $record->recomputeTotals($deductionConfig);
+        }
+        $record->save();
+
+        return response()->json(['success' => true, 'record' => $record]);
+    }
+
+    public function updateRemittanceRecord(Request $request, $payrollId)
+    {
+        $record = PayrollRecord::findOrFail($payrollId);
+        $period = PayrollPeriod::find($record->period_id);
+
+        if (optional($period)->status === 'FINALIZED') {
+            return response()->json(['success' => false, 'error' => 'Period is finalized.'], 403);
+        }
+
+        $field = $request->input('field');
+        $value = round((float) $request->input('value'), 2);
+
+        if ($field === 'allowance_ra') $field = 'allowance_rata';
+
+        if (str_starts_with($field, 'dynamic:')) {
+            $dedId   = (int) substr($field, 8);
+            $dynamic = $record->dynamic_deductions ?? [];
+            $dynamic[$dedId] = $value;
+            $record->dynamic_deductions = $dynamic;
+        } else {
+            $allowed = [
+                'gsis_ee', 'gsis_ec', 'gsis_policy', 'gsis_emergency', 'gsis_real_estate',
+                'gsis_mpl', 'gsis_mpl_lite', 'gsis_gfal', 'gsis_computer', 'gsis_conso',
+                'pagibig_ee', 'pagibig_govt', 'pagibig_mpl', 'pagibig_calamity', 'philhealth_ee', 'withholding_tax',
+                'loan_dbp', 'loan_lbp', 'loan_cngwmpc', 'loan_paracle',
+                'cng_capital_share', 'cng_kiddie_savings', 'cng_savings', 'cng_regular_loan',
+                'cng_crisis_loan', 'cng_coop_canteen', 'cng_coop_store', 'cng_calamity_loan',
+                'cng_abuloy', 'cng_handog', 'cng_b2b_loan', 'cng_petty_cash', 'cng_commodity_loan',
+                'overpayment', 'other_deduction', 'allowance_pera', 'allowance_rata', 'allowance_ta', 'allowance_other',
+            ];
+            if (!in_array($field, $allowed, true)) return response()->json(['success' => false, 'error' => 'Invalid field.'], 422);
+            $record->$field = $value;
+        }
+
+        if (in_array($field, self::CNG_FIELDS, true)) {
+            $cngSum = 0;
+            foreach(self::CNG_FIELDS as $f) { $cngSum += (float) $record->$f; }
+            $record->loan_cngwmpc = $cngSum;
+        }
+
+        if (method_exists($record, 'recomputeTotals')) {
+            $deductionConfig = PayrollDeduction::active()->ordered()->get()->keyBy('id');
+            $record->recomputeTotals($deductionConfig);
+        }
+        $record->save();
 
         return response()->json([
             'success'          => true,
-            'net_pay'          => number_format($netPay, 2),
-            'total_deductions' => number_format($deductions, 2),
-            'total_allowances' => number_format($allowances, 2),
+            'total_deductions' => $record->total_deductions,
+            'total_allowances' => $record->total_allowances,
+            'net_pay'          => $record->net_pay,
+            'philhealth_govt'  => $record->philhealth_govt,
         ]);
     }
 
-    /* ══════════════════════════════════════════════════════
-       FINALIZE PERIOD
-    ══════════════════════════════════════════════════════ */
-    public function finalizePeriod(Request $request, $periodId)
+    public function hideRemittanceRecord(Request $request, $payrollId)
     {
-        $period = PayrollPeriod::findOrFail($periodId);
-        $period->update(['status' => 'FINALIZED']);
-
-        return back()->with('success', 'Payroll period finalized.');
+        $record = PayrollRecord::find($payrollId);
+        if ($record) $record->delete();
+        return response()->json(['success' => true]);
     }
 
-    /* ══════════════════════════════════════════════════════
-       PAYSLIP — employee self-service view
-    ══════════════════════════════════════════════════════ */
-    public function payslip(Request $request)
+    public function pdf($period)
     {
-        $empId   = Auth::user()->employee_id ?? null;
-        $periods = PayrollPeriod::orderByDesc('year')->orderByDesc('month')->get();
-        $selectedPeriodId = $request->query('period_id', optional($periods->first())->period_id);
+        if (!$period instanceof PayrollPeriod) $period = PayrollPeriod::findOrFail($period);
 
-        $record = null;
-        if ($empId && $selectedPeriodId) {
-            $record = PayrollRecord::with(['employee.position', 'employee.department', 'period'])
-                ->where('employee_id', $empId)
-                ->where('period_id', $selectedPeriodId)
-                ->first();
-        }
-
-        return view('payroll.payslip', compact('periods', 'selectedPeriodId', 'record'));
-    }
-
-    /* ══════════════════════════════════════════════════════
-       PAYSLIP PDF
-    ══════════════════════════════════════════════════════ */
-    public function payslipPdf(Request $request, $periodId)
-    {
-        $empId = $request->query('emp_id', Auth::user()->employee_id ?? null);
-
-        $record = PayrollRecord::with(['employee.position', 'employee.department', 'period'])
-            ->where('employee_id', $empId)
-            ->where('period_id', $periodId)
-            ->firstOrFail();
-
-        $pdf = Pdf::loadView('payroll.payslip-pdf', compact('record'))
-            ->setPaper('letter', 'portrait');
-
-        return $pdf->stream("payslip_{$record->employee->last_name}_{$record->period->period_label}.pdf");
-    }
-
-    /* ══════════════════════════════════════════════════════
-       PAYROLL PDF (full list printout)
-    ══════════════════════════════════════════════════════ */
-    public function payrollPdf($periodId)
-    {
-        $period  = PayrollPeriod::findOrFail($periodId);
-        $records = PayrollRecord::with(['employee.position', 'employee.department'])
-            ->where('period_id', $periodId)
+        $records = PayrollRecord::with(['employee.position'])
+            ->where('period_id', $period->period_id)
+            ->orderBy('employee_id')
             ->get();
+            
+        $records = $this->mapOldCngData($records); 
 
-        $pdf = Pdf::loadView('payroll.payroll-pdf', compact('period', 'records'))
-            ->setPaper('legal', 'landscape');
-
+        $pdf = app('dompdf.wrapper');
+        $pdf->setPaper('legal', 'landscape');
+        $pdf->loadView('payroll.payroll-pdf', compact('period', 'records'));
         return $pdf->stream("payroll_{$period->period_label}.pdf");
     }
 
-    /* ══════════════════════════════════════════════════════
-       REMITTANCES VIEW
-    ══════════════════════════════════════════════════════ */
+    public function payslipAllPdf(Request $request, $period)
+    {
+        if (!$period instanceof PayrollPeriod) $period = PayrollPeriod::findOrFail($period);
+
+        $query = PayrollRecord::with(['employee', 'period'])
+            ->where('period_id', $period->period_id)
+            ->orderBy('employee_id');
+
+        if ($empId = $request->input('emp_id')) $query->where('employee_id', $empId);
+
+        $records = $query->get();
+        $records = $this->mapOldCngData($records); 
+
+        $pdf = app('dompdf.wrapper');
+        $pdf->setPaper('letter', 'portrait');
+        $pdf->loadView('payroll.payslip-pdf', compact('records'));
+        return $pdf->stream("payslips_{$period->period_label}.pdf");
+    }
+
+    public function payslip(Request $request)
+    {
+        if ($this->isAdmin()) {
+            $periodId = $request->input('period_id');
+            return redirect()->route('payroll.manage', $periodId ? ['period_id' => $periodId] : []);
+        }
+
+        $user     = Auth::user();
+        $employee = $user?->employee;
+        $periods  = PayrollPeriod::orderByDesc('year')->orderByDesc('month')->get();
+        $selectedPeriodId = $request->input('period_id', optional($periods->first())->period_id);
+
+        $record = $employee
+            ? PayrollRecord::with(['employee', 'period'])
+                ->where('employee_id', $employee->employee_id)
+                ->where('period_id', $selectedPeriodId)
+                ->first()
+            : null;
+            
+        $record = $this->mapOldCngData($record);
+
+        $jsConfig = PayrollDeduction::buildJsConfig();
+        return view('payroll.payslip', compact('periods', 'selectedPeriodId', 'record', 'jsConfig'));
+    }
+
+    public function payslipManagement(Request $request)
+    {
+        $periods = PayrollPeriod::orderByDesc('year')->orderByDesc('month')->get();
+        $selectedPeriodId = $request->input('period_id', optional($periods->first())->period_id);
+        $selectedPeriod = $periods->find($selectedPeriodId);
+
+        $records = PayrollRecord::with(['employee.position', 'employee.department', 'period'])
+            ->where('period_id', optional($selectedPeriod)->period_id)
+            ->orderBy('employee_id')
+            ->get();
+            
+        $records = $this->mapOldCngData($records); 
+
+        $jsConfig = PayrollDeduction::buildJsConfig();
+        return view('payroll.payslip-management', compact('periods', 'selectedPeriod', 'records', 'jsConfig'));
+    }
+
     public function remittances(Request $request)
     {
         $periods = PayrollPeriod::orderByDesc('year')->orderByDesc('month')->get();
-        $selectedPeriodId = $request->query('period_id', optional($periods->first())->period_id);
-        $selectedPeriod   = $periods->find($selectedPeriodId);
+        $selectedPeriodId = $request->input('period_id', optional($periods->first())->period_id);
+        $selectedPeriod = $periods->find($selectedPeriodId);
 
-        $records = collect();
-        if ($selectedPeriod) {
-            $records = PayrollRecord::with(['employee'])
-                ->where('period_id', $selectedPeriod->period_id)
-                ->get();
+        if ($selectedPeriod && $selectedPeriod->status === 'FINALIZED') {
+            if (PayrollRecord::where('period_id', $selectedPeriod->period_id)->count() === 0) {
+                $this->generatePayrollForPeriod($selectedPeriod);
+            }
         }
 
-        $gsis = [
-            'ee'          => $records->sum('gsis_ee'),
-            'govt'        => $records->sum('gsis_govt'),
-            'ec'          => $records->sum('gsis_ec'),
-            'mpl'         => $records->sum('gsis_mpl'),
-            'policy'      => $records->sum('gsis_policy'),
-            'emergency'   => $records->sum('gsis_emergency'),
-            'real_estate' => $records->sum('gsis_real_estate'),
-            'computer'    => $records->sum('gsis_computer'),
-            'gfal'        => $records->sum('gsis_gfal'),
-            'mpl_lite'    => $records->sum('gsis_mpl_lite'),
-            'conso'       => $records->sum('gsis_conso'),
-        ];
+        $records = PayrollRecord::with(['employee.position', 'employee.department', 'period'])
+            ->where('period_id', optional($selectedPeriod)->period_id)
+            ->orderBy('employee_id')
+            ->get();
+            
+        $records = $this->mapOldCngData($records); 
 
-        $pagibig = [
-            'ee'       => $records->sum('pagibig_ee'),
-            'govt'     => $records->sum('pagibig_govt'),
-            'mpl'      => $records->sum('pagibig_mpl'),
-            'calamity' => $records->sum('pagibig_calamity'),
-        ];
+        $jsConfig        = PayrollDeduction::buildJsConfig();
+        $notFixedColumns = collect($jsConfig)->filter(fn($d) => !($d['is_fixed'] ?? true));
 
-        $philhealth = [
-            'ee'   => $records->sum('philhealth_ee'),
-            'govt' => $records->sum('philhealth_govt'),
-        ];
-
-        $loans = [
-            'dbp'     => $records->sum('loan_dbp'),
-            'lbp'     => $records->sum('loan_lbp'),
-            'cngwmpc' => $records->sum('loan_cngwmpc'),
-            'paracle' => $records->sum('loan_paracle'),
-        ];
-
-        $wtax = $records->sum('withholding_tax');
-
-        return view('payroll.remittances', compact(
-            'periods', 'selectedPeriod', 'records',
-            'gsis', 'pagibig', 'philhealth', 'loans', 'wtax'
-        ));
+        return view('payroll.remittances', compact('periods', 'selectedPeriod', 'records', 'jsConfig', 'notFixedColumns'));
     }
 
-    /* ══════════════════════════════════════════════════════
-       REMITTANCE PDF
-    ══════════════════════════════════════════════════════ */
-    public function remittancePdf(Request $request, $periodId, $type)
+    public function remittancePdf($period, string $type)
     {
-        $period  = PayrollPeriod::findOrFail($periodId);
-        $records = PayrollRecord::with('employee')
-            ->where('period_id', $periodId)
+        if (!$period instanceof PayrollPeriod) $period = PayrollPeriod::findOrFail($period);
+
+        $records = PayrollRecord::with(['employee.position'])
+            ->where('period_id', $period->period_id)
+            ->orderBy('employee_id')
             ->get();
+            
+        $records = $this->mapOldCngData($records); 
 
-        $pdf = Pdf::loadView("payroll.remittance-pdf.{$type}", compact('period', 'records'))
-            ->setPaper('legal', 'portrait');
-
+        $pdf = app('dompdf.wrapper');
+        $pdf->setPaper('letter', 'portrait');
+        $pdf->loadView("payroll.remittance-pdf-{$type}", compact('period', 'records'));
         return $pdf->stream("remittance_{$type}_{$period->period_label}.pdf");
+    }
+
+    public function updateSignatory(Request $request, $period)
+    {
+        if (!$period instanceof PayrollPeriod) $period = PayrollPeriod::findOrFail($period);
+        $request->validate(['sig_clerk_name' => 'nullable|string|max:100', 'sig_clerk_title' => 'nullable|string|max:100']);
+        $period->update([
+            'sig_clerk_name'  => strtoupper(trim($request->input('sig_clerk_name',  ''))),
+            'sig_clerk_title' => trim($request->input('sig_clerk_title', '')),
+        ]);
+        return response()->json(['success' => true, 'period' => $period]);
+    }
+
+    public function manage(Request $request)
+    {
+        $periods = PayrollPeriod::orderByDesc('period_id')->get();
+        $selectedPeriodId = $request->query('period_id') ?? optional($periods->first())->period_id;
+        $records = collect();
+
+        if ($selectedPeriodId) {
+            $records = PayrollRecord::with(['employee.position', 'period.createdBy'])
+                ->where('period_id', $selectedPeriodId)
+                ->orderBy('employee_id')
+                ->get();
+                
+            $records = $this->mapOldCngData($records); 
+        }
+
+        $jsConfig = PayrollDeduction::buildJsConfig();
+        return view('payroll.payslip-manage', compact('periods', 'selectedPeriodId', 'records', 'jsConfig'));
     }
 }

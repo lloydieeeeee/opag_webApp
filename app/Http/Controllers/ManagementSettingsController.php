@@ -33,7 +33,9 @@ class ManagementSettingsController extends Controller
             'type_code'        => 'required|string|max:20|unique:leave_type,type_code',
             'is_accrual_based' => 'nullable|boolean',
             'accrual_rate'     => 'nullable|numeric|min:0',
-            'max_days'         => 'nullable|numeric|min:0',
+            'max_days'         => 'nullable|numeric|min:0.5',
+        ], [
+            'max_days.min' => 'Max days must be at least 0.5. Leave blank for unlimited.',
         ]);
         if ($v->fails()) {
             return response()->json(['success' => false, 'message' => $v->errors()->first()], 422);
@@ -57,7 +59,9 @@ class ManagementSettingsController extends Controller
             'type_code'        => 'required|string|max:20|unique:leave_type,type_code,' . $id . ',leave_type_id',
             'is_accrual_based' => 'nullable|boolean',
             'accrual_rate'     => 'nullable|numeric|min:0',
-            'max_days'         => 'nullable|numeric|min:0',
+            'max_days'         => 'nullable|numeric|min:0.5',
+        ], [
+            'max_days.min' => 'Max days must be at least 0.5. Leave blank for unlimited.',
         ]);
         if ($v->fails()) {
             return response()->json(['success' => false, 'message' => $v->errors()->first()], 422);
@@ -80,10 +84,21 @@ class ManagementSettingsController extends Controller
         return response()->json(['success' => true, 'is_active' => (bool) $lt->is_active]);
     }
 
+    /* ── FIX 1: FK-safe delete for Leave Type ── */
     public function destroyLeaveType($id)
     {
-        LeaveType::findOrFail($id)->delete();
-        return response()->json(['success' => true, 'message' => 'Leave type deleted.']);
+        try {
+            LeaveType::findOrFail($id)->delete();
+            return response()->json(['success' => true, 'message' => 'Leave type deleted.']);
+        } catch (\Illuminate\Database\QueryException $e) {
+            if ($e->getCode() === '23000') {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Cannot delete: this leave type is still linked to employee leave balances or applications. Disable it instead.',
+                ]);
+            }
+            return response()->json(['success' => false, 'message' => 'Delete failed. Please try again.']);
+        }
     }
 
     /* ══════════════════════════════════
@@ -126,8 +141,18 @@ class ManagementSettingsController extends Controller
 
     public function destroyDepartment($id)
     {
-        Department::findOrFail($id)->delete();
-        return response()->json(['success' => true, 'message' => 'Department deleted.']);
+        try {
+            Department::findOrFail($id)->delete();
+            return response()->json(['success' => true, 'message' => 'Department deleted.']);
+        } catch (\Illuminate\Database\QueryException $e) {
+            if ($e->getCode() === '23000') {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Cannot delete: employees are still assigned to this department.',
+                ]);
+            }
+            return response()->json(['success' => false, 'message' => 'Delete failed. Please try again.']);
+        }
     }
 
     /* ══════════════════════════════════
@@ -183,12 +208,22 @@ class ManagementSettingsController extends Controller
 
     public function destroyPosition($id)
     {
-        Position::findOrFail($id)->delete();
-        return response()->json(['success' => true, 'message' => 'Position deleted.']);
+        try {
+            Position::findOrFail($id)->delete();
+            return response()->json(['success' => true, 'message' => 'Position deleted.']);
+        } catch (\Illuminate\Database\QueryException $e) {
+            if ($e->getCode() === '23000') {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Cannot delete: employees are still assigned to this position.',
+                ]);
+            }
+            return response()->json(['success' => false, 'message' => 'Delete failed. Please try again.']);
+        }
     }
 
     /* ══════════════════════════════════════════════════════
-       GENERIC HELPERS
+       GENERIC HELPERS  (used by Commutation, Recommendation)
     ══════════════════════════════════════════════════════ */
     private function optionIndex(string $table, string $view)
     {
@@ -231,18 +266,18 @@ class ManagementSettingsController extends Controller
     /* ══════════════════════════════════
        COMMUTATION
     ══════════════════════════════════ */
-    public function commutation()                          { return $this->optionIndex('commutation_options', 'commutation'); }
-    public function storeCommutation(Request $r)           { return $this->optionStore($r, 'commutation_options'); }
-    public function updateCommutation(Request $r, $id)     { return $this->optionUpdate($r, 'commutation_options', $id); }
-    public function destroyCommutation($id)                { return $this->optionDestroy('commutation_options', $id); }
+    public function commutation()                         { return $this->optionIndex('commutation_options',   'commutation'); }
+    public function storeCommutation(Request $r)          { return $this->optionStore($r, 'commutation_options'); }
+    public function updateCommutation(Request $r, $id)    { return $this->optionUpdate($r, 'commutation_options', $id); }
+    public function destroyCommutation($id)               { return $this->optionDestroy('commutation_options', $id); }
 
     /* ══════════════════════════════════
        RECOMMENDATION
     ══════════════════════════════════ */
-    public function recommendation()                       { return $this->optionIndex('recommendation_options', 'recommendation'); }
-    public function storeRecommendation(Request $r)        { return $this->optionStore($r, 'recommendation_options'); }
-    public function updateRecommendation(Request $r, $id)  { return $this->optionUpdate($r, 'recommendation_options', $id); }
-    public function destroyRecommendation($id)             { return $this->optionDestroy('recommendation_options', $id); }
+    public function recommendation()                      { return $this->optionIndex('recommendation_options', 'recommendation'); }
+    public function storeRecommendation(Request $r)       { return $this->optionStore($r, 'recommendation_options'); }
+    public function updateRecommendation(Request $r, $id) { return $this->optionUpdate($r, 'recommendation_options', $id); }
+    public function destroyRecommendation($id)            { return $this->optionDestroy('recommendation_options', $id); }
 
     /* ══════════════════════════════════
        SIGNATORY
@@ -293,10 +328,66 @@ class ManagementSettingsController extends Controller
     public function destroySignatory($id) { return $this->optionDestroy('signatory_options', $id); }
 
     /* ══════════════════════════════════
-       ROLE
+       FIX 2 & 3: ROLE  (was completely missing)
     ══════════════════════════════════ */
-    public function role()                                 { return $this->optionIndex('role_options', 'role'); }
-    public function storeRole(Request $r)                  { return $this->optionStore($r, 'role_options'); }
-    public function updateRole(Request $r, $id)            { return $this->optionUpdate($r, 'role_options', $id); }
-    public function destroyRole($id)                       { return $this->optionDestroy('role_options', $id); }
+    public function role()
+    {
+        $options = DB::table('role_options')->orderBy('sort_order')->orderBy('id')->get();
+        return view('management.role', compact('options'));
+    }
+
+    public function storeRole(Request $r)
+    {
+        $v = Validator::make($r->all(), ['label' => 'required|string|max:200']);
+        if ($v->fails()) {
+            return response()->json(['success' => false, 'message' => $v->errors()->first()], 422);
+        }
+        $max = DB::table('role_options')->max('sort_order') ?? -1;
+        $id  = DB::table('role_options')->insertGetId([
+            'label'      => $r->label,
+            'sort_order' => $max + 1,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+        return response()->json(['success' => true, 'data' => ['id' => $id], 'message' => 'Role option added successfully.']);
+    }
+
+    public function updateRole(Request $r, $id)
+    {
+        $v = Validator::make($r->all(), ['label' => 'required|string|max:200']);
+        if ($v->fails()) {
+            return response()->json(['success' => false, 'message' => $v->errors()->first()], 422);
+        }
+        DB::table('role_options')->where('id', $id)->update([
+            'label'      => $r->label,
+            'updated_at' => now(),
+        ]);
+        return response()->json(['success' => true, 'message' => 'Role option updated successfully.']);
+    }
+
+    public function destroyRole($id)
+    {
+        DB::table('role_options')->where('id', $id)->delete();
+        return response()->json(['success' => true, 'message' => 'Role option deleted.']);
+    }
+
+    /* ══════════════════════════════════════════════════════
+       LEAVE APPLICATION ENFORCEMENT
+       Called from LeaveApplicationController::store()
+
+       Usage:
+           $error = ManagementSettingsController::checkMaxDays($leaveTypeId, $requestedDays);
+           if ($error) return response()->json(['success' => false, 'message' => $error], 422);
+    ══════════════════════════════════════════════════════ */
+    public static function checkMaxDays(int $leaveTypeId, float $requestedDays): ?string
+    {
+        $lt = LeaveType::find($leaveTypeId);
+        if (! $lt) {
+            return 'Invalid leave type selected.';
+        }
+        if ($lt->max_days !== null && $requestedDays > (float) $lt->max_days) {
+            return "You may only apply for up to {$lt->max_days} day(s) of {$lt->type_name} per application. You requested {$requestedDays} day(s).";
+        }
+        return null; // OK
+    }
 }

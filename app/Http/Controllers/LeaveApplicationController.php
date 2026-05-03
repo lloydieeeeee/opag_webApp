@@ -90,6 +90,8 @@ class LeaveApplicationController extends Controller
             ->where('is_monetization', 1)
             ->orderByDesc('application_date')->get();
 
+        // ── Pass max_days info for each leave type so the frontend
+        //    can show a live warning before the user submits ──────────
         $leaveTypes = LeaveType::where('is_active', 1)->orderBy('type_name')->get();
 
         return view('application.leave', compact(
@@ -114,6 +116,7 @@ class LeaveApplicationController extends Controller
         $year       = now()->year;
         $leaveType  = LeaveType::findOrFail($request->leave_type_id);
 
+        // Count working days (Mon–Fri only)
         $start = new \DateTime($request->start_date);
         $end   = new \DateTime($request->end_date);
         $days  = 0;
@@ -122,6 +125,15 @@ class LeaveApplicationController extends Controller
             if ((int)$cur->format('N') < 6) $days++;
             $cur->modify('+1 day');
         }
+
+        // ── Enforce max_days per application ──────────────────────────
+        // Uses the static helper already defined in ManagementSettingsController.
+        // Returns a human-readable error string, or null if OK.
+        $maxError = ManagementSettingsController::checkMaxDays($leaveType->leave_type_id, $days);
+        if ($maxError) {
+            return response()->json(['success' => false, 'message' => $maxError], 422);
+        }
+        // ─────────────────────────────────────────────────────────────
 
         $creditBalance = LeaveCreditBalance::firstOrCreate(
             ['employee_id' => $employeeId, 'leave_type_id' => $leaveType->leave_type_id, 'year' => $year],
@@ -155,7 +167,11 @@ class LeaveApplicationController extends Controller
             Notification::notifyNewLeave($application);
         } catch (\Exception $e) {}
 
-        return response()->json(['success' => true, 'message' => 'Leave application submitted successfully.', 'leave_id' => $application->leave_id]);
+        return response()->json([
+            'success'  => true,
+            'message'  => 'Leave application submitted successfully.',
+            'leave_id' => $application->leave_id,
+        ]);
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -168,16 +184,18 @@ class LeaveApplicationController extends Controller
             'no_of_days'    => 'required|numeric|min:1|max:30',
         ]);
 
-        $employeeId    = session('employee_id');
-        $year          = now()->year;
-        $leaveType     = LeaveType::findOrFail($request->leave_type_id);
+        $employeeId = session('employee_id');
+        $year       = now()->year;
+        $leaveType  = LeaveType::findOrFail($request->leave_type_id);
 
         if (!$leaveType->is_accrual_based) {
             return response()->json(['success' => false, 'message' => 'Only accrual-based leave types can be monetized.'], 422);
         }
 
         $creditBalance = LeaveCreditBalance::where('employee_id', $employeeId)
-            ->where('leave_type_id', $leaveType->leave_type_id)->where('year', $year)->first();
+            ->where('leave_type_id', $leaveType->leave_type_id)
+            ->where('year', $year)
+            ->first();
 
         if (!$creditBalance || $creditBalance->remaining_balance < $request->no_of_days) {
             return response()->json(['success' => false, 'message' => 'Insufficient leave balance for monetization.'], 422);
@@ -211,7 +229,9 @@ class LeaveApplicationController extends Controller
     public function cancel($id)
     {
         $employeeId  = session('employee_id');
-        $application = LeaveApplication::where('leave_id', $id)->where('employee_id', $employeeId)->firstOrFail();
+        $application = LeaveApplication::where('leave_id', $id)
+            ->where('employee_id', $employeeId)
+            ->firstOrFail();
 
         if ($application->status !== 'PENDING') {
             return response()->json(['success' => false, 'message' => 'Only PENDING applications can be cancelled.'], 422);
@@ -247,21 +267,17 @@ class LeaveApplicationController extends Controller
             ->whereHas('leaveType', fn($q) => $q->where('type_code', 'SL'))
             ->where('year', $year)->first();
 
-        // ── 6A: ALL active leave types from DB (with legal_reference) ──────
         $allLeaveTypes = LeaveType::where('is_active', 1)
             ->orderBy('leave_type_id')
             ->get();
 
-        // ── 6B: detail groups + items ───────────────────────────────────────
         $detailGroups = LeaveDetailGroup::with(['items' => fn($q) => $q->orderBy('sort_order')])
             ->orderBy('sort_order')
             ->get();
 
-        // ── 6D: commutation options ─────────────────────────────────────────
         $commutationOptions = DB::table('commutation_options')
             ->orderBy('sort_order')->get();
 
-        // ── 7B: recommendation options ──────────────────────────────────────
         $recommendationOptions = DB::table('recommendation_options')
             ->orderBy('sort_order')->get();
 
@@ -269,10 +285,10 @@ class LeaveApplicationController extends Controller
             'app',
             'vlBalance',
             'slBalance',
-            'allLeaveTypes',            // ← 6A dynamic
-            'detailGroups',             // ← 6B dynamic
-            'commutationOptions',       // ← 6D dynamic
-            'recommendationOptions',    // ← 7B dynamic
+            'allLeaveTypes',
+            'detailGroups',
+            'commutationOptions',
+            'recommendationOptions',
         ));
     }
 }

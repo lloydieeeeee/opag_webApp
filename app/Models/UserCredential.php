@@ -1,4 +1,5 @@
 <?php
+
 namespace App\Models;
 
 use Illuminate\Foundation\Auth\User as Authenticatable;
@@ -15,16 +16,32 @@ class UserCredential extends Authenticatable
         'is_active',
     ];
 
-    // Hide password from serialization
     protected $hidden = ['password_hash'];
 
-    // ── Tell Laravel which column is the password ──
-    public function getAuthPassword()
+    public function getAuthPassword(): string
     {
         return $this->password_hash;
     }
 
-    // ── Relationships ──
+    public function hasRole(string $role): bool
+    {
+        $access = $this->userAccess;
+
+        if (! $access) {
+            return false;
+        }
+
+        if ($role === 'admin' && isset($access->is_admin)) {
+            return (bool) $access->is_admin;
+        }
+
+        if (isset($access->role)) {
+            return $access->role === $role;
+        }
+
+        return false;
+    }
+
     public function employee()
     {
         return $this->belongsTo(Employee::class, 'employee_id', 'employee_id');

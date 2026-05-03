@@ -134,7 +134,7 @@ class AdminHalfDayController extends Controller
             if ($newStatus === 'APPROVED') {
                 $updates['approved_date'] = Carbon::now()->toDateString();
             } elseif ($newStatus === 'REJECTED') {
-                $updates['rejection_reason'] = $reason;
+                $updates['reason'] = $reason;
                 $updates['approved_date']    = null;
             } elseif ($newStatus === 'CANCELLED') {
                 $updates['approved_date'] = null;

@@ -124,9 +124,11 @@
 .bdm:hover { background: #b91c1c; }
 .dib { width: 52px; height: 52px; border-radius: 16px; background: #fee2e2; display: flex; align-items: center; justify-content: center; margin-bottom: 16px; }
 
-/* ── Max Days hint in modal ── */
+/* ── Max Days hint / error in modal ── */
 .max-hint { font-size: 11px; color: #166534; background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 7px; padding: 6px 10px; margin-top: 6px; display: none; }
 .max-hint.show { display: block; }
+.max-err  { font-size: 11px; color: #dc2626; background: #fee2e2; border: 1px solid #fca5a5; border-radius: 7px; padding: 6px 10px; margin-top: 6px; display: none; }
+.max-err.show  { display: block; }
 
 /* ── Toast ── */
 #toast { position: fixed; bottom: 24px; right: 24px; z-index: 400; min-width: 280px; background: #fff; border-radius: 14px; padding: 14px 18px; box-shadow: 0 8px 32px rgba(0,0,0,.15); display: flex; align-items: center; gap: 12px; opacity: 0; transform: translateY(14px); transition: all .28s; pointer-events: none; }
@@ -328,10 +330,11 @@
                     Max Days Allowed
                     <span class="fl-note"> — blank = unlimited</span>
                 </label>
-                <input class="fi" id="fM" type="number" step="0.5" min="0"
+                <input class="fi" id="fM" type="number" step="0.5" min="0.5"
                        placeholder="e.g. 5  (blank = unlimited)"
                        oninput="updateMaxHint()">
                 <p class="max-hint" id="maxHint"></p>
+                <p class="max-err"  id="maxErr"></p>
             </div>
         </div>
 
@@ -466,13 +469,24 @@ function onAcc() {
     document.getElementById('splitRow').style.gridTemplateColumns = on ? '1fr 1fr' : '1fr';
 }
 
-/* ── Max Days live hint ── */
+/* ── Max Days live hint / validation ── */
 function updateMaxHint() {
     const v    = parseFloat(document.getElementById('fM').value);
     const hint = document.getElementById('maxHint');
+    const err  = document.getElementById('maxErr');
+    err.classList.remove('show');
     if (!isNaN(v) && v > 0) {
         hint.textContent = `Employees may apply at most ${v} day${v === 1 ? '' : 's'} per application for this leave type.`;
         hint.classList.add('show');
+        if (v < 0.5) {
+            err.textContent = 'Max days must be at least 0.5.';
+            err.classList.add('show');
+            hint.classList.remove('show');
+        }
+    } else if (!isNaN(v) && v <= 0 && document.getElementById('fM').value !== '') {
+        err.textContent = 'Max days must be greater than 0.';
+        err.classList.add('show');
+        hint.classList.remove('show');
     } else {
         hint.classList.remove('show');
     }
@@ -482,6 +496,8 @@ function updateMaxHint() {
 function clearE() {
     ['fN','fC'].forEach(i => document.getElementById(i).classList.remove('err'));
     document.querySelectorAll('.ferr').forEach(e => e.style.display = 'none');
+    document.getElementById('maxErr').classList.remove('show');
+    document.getElementById('maxHint').classList.remove('show');
 }
 
 /* ── Open Add modal ── */
@@ -498,6 +514,7 @@ function openAdd() {
     document.getElementById('accRow').style.display = 'none';
     document.getElementById('splitRow').style.gridTemplateColumns = '1fr';
     document.getElementById('maxHint').classList.remove('show');
+    document.getElementById('maxErr').classList.remove('show');
     clearE();
     document.getElementById('fo').classList.add('show');
     setTimeout(() => document.getElementById('fN').focus(), 150);
@@ -534,6 +551,13 @@ function saveForm() {
     let ok = true;
     if (!nm) { document.getElementById('eN').style.display = 'block'; document.getElementById('fN').classList.add('err'); ok = false; }
     if (!cd) { document.getElementById('eC').style.display = 'block'; document.getElementById('fC').classList.add('err'); ok = false; }
+    if (mx !== '' && (isNaN(parseFloat(mx)) || parseFloat(mx) <= 0)) {
+        const err = document.getElementById('maxErr');
+        err.textContent = 'Max days must be a positive number (e.g. 5). Leave blank for unlimited.';
+        err.classList.add('show');
+        document.getElementById('fM').classList.add('err');
+        ok = false;
+    }
     if (!ok) return;
     const b = document.getElementById('bS');
     b.disabled = true; b.textContent = 'Saving…';

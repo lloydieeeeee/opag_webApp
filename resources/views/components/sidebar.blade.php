@@ -13,11 +13,11 @@
         ]],
         ['label' => 'Leave Card',          'route' => 'leave-card.index',   'icon' => 'card'],
         ['label' => 'Payroll', 'icon' => 'dollar', 'children' => [
-        ['label' => 'Create Payroll',       'route' => 'payroll.index'],
-        ['label' => 'Remittances',          'route' => 'payroll.remittances'],
-        ['label' => 'Payslip Management',   'route' => 'payroll.payslip'],
-        ['label' => 'Deduction Management', 'route' => 'payroll.deductions.index'],
-    ]],
+            ['label' => 'Create Payroll',       'route' => 'payroll.index'],
+            ['label' => 'Remittances',          'route' => 'payroll.remittances'],
+            ['label' => 'Payslip Management',   'route' => 'payroll.manage'],
+            ['label' => 'Deduction Management', 'route' => 'payroll.deductions.index'],
+        ]],
         ['label' => 'Management Settings', 'route' => 'settings.leaveType', 'icon' => 'settings'],
         ['label' => 'User Logs',           'route' => 'logs.index',         'icon' => 'file'],
     ];

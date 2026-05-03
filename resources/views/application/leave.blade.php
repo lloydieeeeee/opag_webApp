@@ -514,7 +514,6 @@
                         <option value="">All Status</option>
                         <option value="PENDING">Pending</option>
                         <option value="RECEIVED">Received</option>
-                        <option value="ON-PROCESS">On-Process</option>
                         <option value="APPROVED">Approved</option>
                         <option value="REJECTED">Denied</option>
                         <option value="CANCELLED">Cancelled</option>
